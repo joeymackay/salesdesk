@@ -52,6 +52,7 @@ const clearCfg = () => {
   }
 };
 const GH = "https://api.github.com";
+const APP_BUILD = "GitHub build \xB7 v2";
 function b64encode(str) {
   const bytes = new TextEncoder().encode(str);
   let bin = "";
@@ -67,25 +68,101 @@ function b64decode(b64) {
   return new TextDecoder("utf-8").decode(bytes);
 }
 const ghHeaders = (token) => ({
-  Authorization: `Bearer ${token}`,
+  // strip ALL whitespace — a token pasted on a phone often picks up a space or newline,
+  // which makes the browser reject the request outright as a network error
+  Authorization: `Bearer ${String(token).replace(/\s/g, "")}`,
   Accept: "application/vnd.github+json",
   "X-GitHub-Api-Version": "2022-11-28"
 });
+function ghError(e) {
+  if (e && (e.name === "TypeError" || /failed to fetch|networkerror|load failed/i.test(e.message || ""))) {
+    return new Error("Couldn't reach GitHub. Check your connection, or run the connection test below.");
+  }
+  return e;
+}
 const ghContentsUrl = (cfg) => {
   const path = String(cfg.path || "").replace(/^\/+/, "");
   return `${GH}/repos/${cfg.owner}/${cfg.repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}`;
 };
 let fileSha = null;
 async function ghCheck(cfg) {
-  const res = await fetch(`${GH}/repos/${cfg.owner}/${cfg.repo}`, { headers: ghHeaders(cfg.token) });
-  if (res.status === 401) throw new Error("That token was rejected. Check you pasted it fully.");
-  if (res.status === 404) throw new Error("Repo not found \u2014 check the username and repo name, and that the token can see it.");
+  let res;
+  try {
+    res = await fetch(`${GH}/repos/${cfg.owner}/${cfg.repo}`, { headers: ghHeaders(cfg.token) });
+  } catch (e) {
+    throw ghError(e);
+  }
+  if (res.status === 401) throw new Error("That token was rejected. Check you pasted all of it.");
+  if (res.status === 404) throw new Error("Repo not found \u2014 check the username and repo name, and that the token can see this repo.");
   if (!res.ok) throw new Error(`GitHub error (${res.status})`);
   return true;
 }
+async function ghDiagnose(cfg) {
+  const steps = [];
+  const add = (label, ok, detail) => steps.push({ label, ok, detail });
+  try {
+    const r = await fetch(`${GH}/rate_limit`);
+    add("Reach GitHub", r.ok, r.ok ? "api.github.com is reachable" : `Unexpected status ${r.status}`);
+    if (!r.ok) return steps;
+  } catch (e) {
+    add("Reach GitHub", false, "Blocked or offline \u2014 the browser can't reach api.github.com at all. A network/VPN/firewall is likely blocking it.");
+    return steps;
+  }
+  try {
+    const r = await fetch(`${GH}/user`, { headers: ghHeaders(cfg.token) });
+    if (r.status === 401) {
+      add("Token accepted", false, "GitHub rejected the token (401). It may be incomplete, expired, or revoked.");
+      return steps;
+    }
+    if (!r.ok) {
+      add("Token accepted", false, `Unexpected status ${r.status}`);
+      return steps;
+    }
+    const u = await r.json();
+    add("Token accepted", true, u.login ? `Signed in as ${u.login}` : "Token is valid");
+    if (u.login && cfg.owner && u.login.toLowerCase() !== cfg.owner.toLowerCase()) {
+      add("Username matches", false, `Token belongs to "${u.login}" but you entered "${cfg.owner}". Use ${u.login}.`);
+    }
+  } catch (e) {
+    add("Token accepted", false, "Network error while checking the token.");
+    return steps;
+  }
+  try {
+    const r = await fetch(`${GH}/repos/${cfg.owner}/${cfg.repo}`, { headers: ghHeaders(cfg.token) });
+    if (r.status === 404) {
+      add("Repo visible", false, `Can't see ${cfg.owner}/${cfg.repo}. Check the name, and that the token was granted access to THIS repo.`);
+      return steps;
+    }
+    if (!r.ok) {
+      add("Repo visible", false, `Unexpected status ${r.status}`);
+      return steps;
+    }
+    const j = await r.json();
+    add("Repo visible", true, `${j.full_name}${j.private ? " (private)" : ""}`);
+    const perms = j.permissions || {};
+    add("Write permission", !!perms.push, perms.push ? "Token can write" : "Token is read-only \u2014 set Contents to 'Read and write'.");
+  } catch (e) {
+    add("Repo visible", false, "Network error while checking the repo.");
+    return steps;
+  }
+  try {
+    const r = await fetch(`${ghContentsUrl(cfg)}?ref=${encodeURIComponent(cfg.branch || "main")}`, { headers: ghHeaders(cfg.token) });
+    if (r.status === 404) add("Data file", true, `${cfg.path} doesn't exist yet \u2014 it'll be created on your first change. That's fine.`);
+    else if (r.ok) add("Data file", true, `Found ${cfg.path}`);
+    else add("Data file", false, `Unexpected status ${r.status}`);
+  } catch (e) {
+    add("Data file", false, "Network error while checking the file.");
+  }
+  return steps;
+}
 async function ghReadFile(cfg) {
   const url = `${ghContentsUrl(cfg)}?ref=${encodeURIComponent(cfg.branch || "main")}&t=${Date.now()}`;
-  const res = await fetch(url, { headers: ghHeaders(cfg.token) });
+  let res;
+  try {
+    res = await fetch(url, { headers: ghHeaders(cfg.token) });
+  } catch (e) {
+    throw ghError(e);
+  }
   if (res.status === 404) {
     fileSha = null;
     return null;
@@ -103,11 +180,16 @@ async function ghWriteFile(cfg, text) {
     branch: cfg.branch || "main"
   };
   if (fileSha) body.sha = fileSha;
-  let res = await fetch(ghContentsUrl(cfg), {
-    method: "PUT",
-    headers: { ...ghHeaders(cfg.token), "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
+  let res;
+  try {
+    res = await fetch(ghContentsUrl(cfg), {
+      method: "PUT",
+      headers: { ...ghHeaders(cfg.token), "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  } catch (e) {
+    throw ghError(e);
+  }
   if (res.status === 409 || res.status === 422) {
     await ghReadFile(cfg);
     if (fileSha) body.sha = fileSha;
@@ -2525,12 +2607,16 @@ function ConfigScreen({ cfg, err, fontCss, onSave }) {
   const [path, setPath] = useState(cfg.path || "salesdesk-data.json");
   const [checking, setChecking] = useState(false);
   const [localErr, setLocalErr] = useState("");
-  const valid = token.trim().length > 10 && owner.trim() && repo.trim() && path.trim();
+  const [diag, setDiag] = useState(null);
+  const [diagBusy, setDiagBusy] = useState(false);
+  const clean = () => ({ token: token.replace(/\s/g, ""), owner: owner.trim(), repo: repo.trim(), path: path.trim().replace(/^\/+/, ""), branch: "main" });
+  const valid = token.replace(/\s/g, "").length > 10 && owner.trim() && repo.trim() && path.trim();
   const submit = async () => {
     if (!valid || checking) return;
-    const c = { token: token.trim(), owner: owner.trim(), repo: repo.trim(), path: path.trim().replace(/^\/+/, ""), branch: "main" };
+    const c = clean();
     setChecking(true);
     setLocalErr("");
+    setDiag(null);
     try {
       await ghCheck(c);
       onSave(c);
@@ -2540,10 +2626,36 @@ function ConfigScreen({ cfg, err, fontCss, onSave }) {
       setChecking(false);
     }
   };
+  const runDiag = async () => {
+    setDiagBusy(true);
+    setDiag(null);
+    setLocalErr("");
+    try {
+      setDiag(await ghDiagnose(clean()));
+    } catch (e) {
+      setLocalErr(e.message);
+    } finally {
+      setDiagBusy(false);
+    }
+  };
+  const forceUpdate = async () => {
+    try {
+      if ("serviceWorker" in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((r) => r.unregister()));
+      }
+      if (window.caches) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((k) => caches.delete(k)));
+      }
+    } catch (e) {
+    }
+    window.location.reload(true);
+  };
   const lbl = { fontSize: 12, fontWeight: 600, color: C.ink, display: "block", marginBottom: 5 };
   const fld = { ...inputStyle, fontFamily: FONT_MONO, fontSize: 12.5, marginBottom: 14 };
   const shown = localErr || err;
-  return /* @__PURE__ */ React.createElement("div", { style: { fontFamily: FONT_BODY, background: C.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 } }, /* @__PURE__ */ React.createElement("style", null, fontCss), /* @__PURE__ */ React.createElement("div", { style: { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 16, padding: "30px 26px", maxWidth: 460, width: "100%" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 25, letterSpacing: "-0.02em", marginBottom: 6, textAlign: "center" } }, "Sales", /* @__PURE__ */ React.createElement("span", { style: { color: C.green } }, "Desk")), /* @__PURE__ */ React.createElement("p", { style: { color: C.inkSoft, fontSize: 13.5, lineHeight: 1.55, margin: "0 0 20px", textAlign: "center" } }, "One-time setup. Connect the private GitHub repo that holds your data file."), /* @__PURE__ */ React.createElement("label", { style: lbl }, "GitHub personal access token"), /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { style: { fontFamily: FONT_BODY, background: C.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 } }, /* @__PURE__ */ React.createElement("style", null, fontCss), /* @__PURE__ */ React.createElement("div", { style: { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 16, padding: "30px 26px", maxWidth: 460, width: "100%" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 25, letterSpacing: "-0.02em", marginBottom: 6, textAlign: "center" } }, "Sales", /* @__PURE__ */ React.createElement("span", { style: { color: C.green } }, "Desk")), /* @__PURE__ */ React.createElement("p", { style: { color: C.inkSoft, fontSize: 13.5, lineHeight: 1.55, margin: "0 0 6px", textAlign: "center" } }, "Connect the private GitHub repo that holds your data file."), /* @__PURE__ */ React.createElement("p", { style: { color: C.inkSoft, fontSize: 10.5, fontFamily: FONT_MONO, margin: "0 0 20px", textAlign: "center" } }, APP_BUILD), /* @__PURE__ */ React.createElement("label", { style: lbl }, "GitHub personal access token"), /* @__PURE__ */ React.createElement(
     "input",
     {
       type: "password",
@@ -2551,6 +2663,9 @@ function ConfigScreen({ cfg, err, fontCss, onSave }) {
       onChange: (e) => setToken(e.target.value),
       placeholder: "github_pat_\u2026",
       autoComplete: "off",
+      autoCorrect: "off",
+      autoCapitalize: "none",
+      spellCheck: "false",
       style: fld
     }
   ), /* @__PURE__ */ React.createElement("label", { style: lbl }, "Your GitHub username"), /* @__PURE__ */ React.createElement(
@@ -2559,7 +2674,9 @@ function ConfigScreen({ cfg, err, fontCss, onSave }) {
       value: owner,
       onChange: (e) => setOwner(e.target.value),
       placeholder: "your-username",
+      autoCorrect: "off",
       autoCapitalize: "none",
+      spellCheck: "false",
       style: fld
     }
   ), /* @__PURE__ */ React.createElement("label", { style: lbl }, "Repository name"), /* @__PURE__ */ React.createElement(
@@ -2568,7 +2685,9 @@ function ConfigScreen({ cfg, err, fontCss, onSave }) {
       value: repo,
       onChange: (e) => setRepo(e.target.value),
       placeholder: "salesdesk-data",
+      autoCorrect: "off",
       autoCapitalize: "none",
+      spellCheck: "false",
       style: fld
     }
   ), /* @__PURE__ */ React.createElement("label", { style: lbl }, "File name"), /* @__PURE__ */ React.createElement(
@@ -2577,7 +2696,9 @@ function ConfigScreen({ cfg, err, fontCss, onSave }) {
       value: path,
       onChange: (e) => setPath(e.target.value),
       placeholder: "salesdesk-data.json",
+      autoCorrect: "off",
       autoCapitalize: "none",
+      spellCheck: "false",
       style: { ...fld, marginBottom: 6 }
     }
   ), /* @__PURE__ */ React.createElement("p", { style: { fontSize: 11, color: C.inkSoft, margin: "0 0 18px", lineHeight: 1.45 } }, "If the file doesn't exist yet, SalesDesk creates it on your first change."), /* @__PURE__ */ React.createElement(
@@ -2587,6 +2708,6 @@ function ConfigScreen({ cfg, err, fontCss, onSave }) {
       style: { width: "100%", justifyContent: "center", fontSize: 14.5, padding: "11px 18px", opacity: valid && !checking ? 1 : 0.55 }
     },
     checking ? "Checking\u2026" : "Connect"
-  ), shown && /* @__PURE__ */ React.createElement("p", { style: { color: C.red, fontSize: 12, marginTop: 12, marginBottom: 0, lineHeight: 1.45 } }, shown), /* @__PURE__ */ React.createElement("p", { style: { fontSize: 11, color: C.inkSoft, marginTop: 14, marginBottom: 0, textAlign: "center", lineHeight: 1.5 } }, "Your token is stored only on this device \u2014 it never leaves it except to talk to GitHub.")));
+  ), shown && /* @__PURE__ */ React.createElement("p", { style: { color: C.red, fontSize: 12.5, marginTop: 12, marginBottom: 0, lineHeight: 1.5 } }, shown), /* @__PURE__ */ React.createElement("div", { style: { borderTop: `1px solid ${C.line}`, marginTop: 18, paddingTop: 14 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement(Btn, { kind: "ghost", small: true, onClick: runDiag, style: { flex: 1, justifyContent: "center" } }, diagBusy ? "Testing\u2026" : "Run connection test"), /* @__PURE__ */ React.createElement(Btn, { kind: "ghost", small: true, onClick: forceUpdate, title: "Clear cached app files and reload", style: { flex: 1, justifyContent: "center" } }, "Force update")), diag && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, display: "flex", flexDirection: "column", gap: 8 } }, diag.map((s, i) => /* @__PURE__ */ React.createElement("div", { key: i, style: { display: "flex", gap: 8, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement("span", { style: { color: s.ok ? C.green : C.red, fontWeight: 700, fontSize: 13, lineHeight: 1.4, flex: "none" } }, s.ok ? "\u2713" : "\u2717"), /* @__PURE__ */ React.createElement("div", { style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, fontWeight: 600, color: C.ink } }, s.label), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11.5, color: s.ok ? C.inkSoft : C.red, lineHeight: 1.45 } }, s.detail)))))), /* @__PURE__ */ React.createElement("p", { style: { fontSize: 11, color: C.inkSoft, marginTop: 14, marginBottom: 0, textAlign: "center", lineHeight: 1.5 } }, "Your token is stored only on this device.")));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(/* @__PURE__ */ React.createElement(SalesDesk, null));
